@@ -1,0 +1,8 @@
+/target
+build.log
+probe.txt
+exif*.txt
+ui*.png
+crop*.png
+server/uploads/
+server/metadata.jsonl
