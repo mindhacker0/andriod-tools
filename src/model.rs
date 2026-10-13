@@ -163,7 +163,7 @@ impl ScanScope {
 pub struct UploadConfig {
     /// 服务器根地址，例如 `http://192.168.1.10:8080`。
     pub base_url: String,
-    /// 唯一接口路径，默认 `/api/photos/upload`。
+    /// 唯一接口路径，默认 `/api/photo/upload`（对齐 NestJS 的 `@Controller('photo')` + `@Post('/upload')`）。
     pub api_path: String,
     /// 可选 Bearer Token。
     pub token: String,
@@ -187,7 +187,7 @@ impl Default for UploadConfig {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:8080".to_string(),
-            api_path: "/api/photos/upload".to_string(),
+            api_path: "/api/photo/upload".to_string(),
             token: String::new(),
             field_metadata: "metadata".to_string(),
             field_file: "file".to_string(),

@@ -3,7 +3,7 @@
 
 接收 phone-tool 上传的 multipart/form-data：
 
-    POST /api/photos/upload
+    POST /api/photo/upload
       - metadata : JSON 字符串（照片全部信息）
       - file     : 照片二进制（可选）
 
@@ -84,7 +84,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self.path.startswith("/api/photos/upload"):
+        # 兼容新默认路径 /api/photo/upload，同时保留旧路径 /api/photos/upload
+        if not (
+            self.path.startswith("/api/photo/upload")
+            or self.path.startswith("/api/photos/upload")
+        ):
             self._json(404, {"error": f"unknown path {self.path}"})
             return
 
@@ -179,7 +183,7 @@ def main() -> int:
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"phone-tool 参考服务端已启动: http://{args.host}:{args.port}/api/photos/upload")
+    print(f"phone-tool 参考服务端已启动: http://{args.host}:{args.port}/api/photo/upload")
     print(f"  照片保存到 : {UPLOAD_DIR}")
     print(f"  元数据追加到: {METADATA_FILE}")
     print("  Ctrl+C 退出")

@@ -1,5 +1,5 @@
 param(
-  [string]$Out = "G:\andriodTools\ui.png",
+  [string]$Out = "G:\andriod-tools\ui.png",
   [int]$ClickX = -1,
   [int]$ClickY = -1,
   [int]$DragFromX = -1,
