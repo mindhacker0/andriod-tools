@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mtp_rs::mtp::{MtpDevice, ObjectHandle, Storage};
@@ -158,6 +158,45 @@ struct State {
     storages: Vec<Storage>,
     storage_meta: Vec<StorageSummary>,
     scan: ScanAccum,
+    /// 最近一次扫描用的范围；[`recover_session`] 重连后照原范围重扫。
+    last_scope: Option<ScanScope>,
+    /// 界面重绘回调：自动重连里的“安静等待”用它保持界面不假死。
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 最近一次自动重连的时间；用来给自动重连加冷却，避免排队中的多个读取各自重连一遍。
+    last_recovery_attempt: Option<Instant>,
+    /// 设备自带缩略图资源（`WPD_RESOURCE_THUMBNAIL`）是否已被证明不可用。
+    ///
+    /// 有些机型/驱动会对它报设备级错误（如 0x80070141）；既然一次不行，就没必要每张照片都试一遍。
+    thumbnail_resource_bad: bool,
+    /// 最近一次向用户提示“设备够不着”的时间；同一类错误只提醒一次，别刷屏。
+    unreachable_last: Option<Instant>,
+}
+
+impl State {
+    /// 是否允许再自动重连一次。
+    ///
+    /// 会话失效时往往有多个读取（最多 8 个缩略图 + EXIF）在排队，如果每个失败都各自
+    /// 重连一轮，会变成“重连风暴”。冷却期内只允许第一个失败触发重连，其余等它好。
+    fn recovery_allowed(&mut self) -> bool {
+        match self.last_recovery_attempt {
+            Some(t) if t.elapsed() < Duration::from_secs(60) => false,
+            _ => {
+                self.last_recovery_attempt = Some(Instant::now());
+                true
+            }
+        }
+    }
+
+    /// 是否该就 `ERROR_DEVICE_UNREACHABLE` 提醒用户一次（两分钟内只提醒一次）。
+    fn should_report_unreachable(&mut self) -> bool {
+        match self.unreachable_last {
+            Some(t) if t.elapsed() < Duration::from_secs(120) => false,
+            _ => {
+                self.unreachable_last = Some(Instant::now());
+                true
+            }
+        }
+    }
 }
 
 /// 启动工作线程。
@@ -167,7 +206,7 @@ pub fn spawn(repaint: impl Fn() + Send + Sync + 'static) -> WorkerHandle {
     let cancel = Arc::new(AtomicBool::new(false));
 
     let cancel_for_thread = cancel.clone();
-    let repaint = Arc::new(repaint);
+    let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
 
     std::thread::Builder::new()
         .name("mtp-worker".to_string())
@@ -188,6 +227,7 @@ pub fn spawn(repaint: impl Fn() + Send + Sync + 'static) -> WorkerHandle {
             };
 
             let mut state = State::default();
+            state.repaint = Some(Arc::clone(&repaint));
             while let Ok(cmd) = cmd_rx.recv() {
                 let result = rt.block_on(handle_cmd(cmd, &mut state, &evt_tx, &cancel_for_thread));
                 if let Err(e) = result {
@@ -228,9 +268,12 @@ async fn handle_cmd(
         },
         Cmd::Connect { device } => connect(state, device, tx).await,
         Cmd::Disconnect => disconnect(state, tx).await,
-        Cmd::Scan { scope } => scan(state, scope, tx, cancel).await,
-        Cmd::Thumbnail { key } => thumbnail(state, key, tx).await,
-        Cmd::Exif { key } => load_exif(state, key, tx).await,
+        Cmd::Scan { scope } => {
+            state.last_scope = Some(scope);
+            scan(state, scope, tx, cancel).await
+        }
+        Cmd::Thumbnail { key } => thumbnail(state, key, tx, cancel).await,
+        Cmd::Exif { key } => load_exif(state, key, tx, cancel).await,
         Cmd::Upload { keys, cfg } => upload(state, keys, cfg, tx).await,
     }
 }
@@ -282,7 +325,7 @@ fn list_devices(tx: &Sender<Evt>) -> Result<()> {
     Ok(())
 }
 
-/// 打开设备并读取存储分区。
+/// 打开设备并读取存储分区（**不**向界面发 `Evt::Connected`）。
 ///
 /// Windows 上手机枚举为 **WPD** 设备，而 USB 描述符里的序列号往往与 WPD 序列号不同，
 /// 所以打开顺序按“可靠性从高到低”排：
@@ -290,7 +333,10 @@ fn list_devices(tx: &Sender<Evt>) -> Result<()> {
 /// 1. **USB 位置** —— `open_by_location` 会用 VID/PID 关联到 WPD 设备，这是 Windows 上最稳的路径；
 /// 2. **序列号** —— 当 WPD 序列号与 USB 序列号一致时才有效；
 /// 3. **第一台设备** —— 直接用 WPD 枚举，适合设备列表为空（nusb 认不到）的情况。
-async fn connect(
+///
+/// 单独拆出这一层是为了让 [`recover_session`] 复用：自动重连时不能再发
+/// `Evt::Connected`，否则界面会把它当作一次新的手动连接而再触发一遍扫描。
+async fn open_session(
     state: &mut State,
     requested: Option<DeviceSummary>,
     tx: &Sender<Evt>,
@@ -382,6 +428,8 @@ async fn connect(
     state.storages = storages;
     state.storage_meta = metas.clone();
     state.scan.stored.clear();
+    // 新会话重新评估“设备自带缩略图资源”是否可用。
+    state.thumbnail_resource_bad = false;
 
     let _ = tx.send(Evt::Log(format!(
         "已连接: {} {} （序列号 {}）",
@@ -400,9 +448,25 @@ async fn connect(
         let _ = tx.send(Evt::Error(msg));
         return Ok(());
     }
+    Ok(())
+}
+
+/// 连接设备：打开会话并通知界面（界面收到 `Evt::Connected` 后会自动开始扫描）。
+async fn connect(
+    state: &mut State,
+    requested: Option<DeviceSummary>,
+    tx: &Sender<Evt>,
+) -> Result<()> {
+    open_session(state, requested, tx).await?;
+    // 手动连接成功即视为“用户重新来过了”，清掉自动重连的冷却。
+    state.last_recovery_attempt = None;
+    // 没有任何存储分区时 `open_session` 已经发过错误提示，别再当成连接成功。
+    if state.storages.is_empty() {
+        return Ok(());
+    }
     let _ = tx.send(Evt::Connected {
         device: state.device_summary.clone(),
-        storages: metas,
+        storages: state.storage_meta.clone(),
     });
     Ok(())
 }
@@ -421,6 +485,92 @@ async fn disconnect(state: &mut State, tx: &Sender<Evt>) -> Result<()> {
     let _ = tx.send(Evt::Log("已断开设备".to_string()));
     let _ = tx.send(Evt::Disconnected);
     Ok(())
+}
+
+/// Windows `ERROR_DEVICE_UNREACHABLE`（`0x80070141`）：设备“够不着”，传输根本建不起来。
+///
+/// 这是**设备 / USB 通道**层面的错误，不是程序里的会话过期：在资源管理器里从手机复制一张
+/// 照片同样会失败。重开会话救不回它，只能先把设备 / 线 / 口弄好，所以这里不做自动重连，
+/// 只给用户一次清晰的提示（`mtp-rs` 把它归为未映射的 HRESULT，原样透出中文系统消息）。
+fn is_device_unreachable(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("0x80070141") || m.contains("无法连接至设备") || m.contains("device is unreachable")
+}
+
+/// `ERROR_DEVICE_UNREACHABLE` 的处理建议（只在第一次遇到时弹一次红色横幅）。
+const DEVICE_UNREACHABLE_HINT: &str = "\
+读取手机数据失败：Windows 报 ERROR_DEVICE_UNREACHABLE（0x80070141）——“设备够不着”。\n\
+这是设备 / USB 通道层面的问题，程序修不了：在资源管理器里从手机复制一张照片到电脑同样会失败。\n\
+请按顺序排查：① 拔线重插并重选“文件传输 / MTP”；② 换 USB 口（优先主板后置 / USB 2.0，别用 Hub）；\n\
+③ 换一根能传数据的线；④ 关掉其它占用手机的软件；⑤ 重启手机。\n\
+先在资源管理器里能成功复制一张照片，再回到本程序点「🔌 连接」。";
+
+/// 判断一条设备错误是否意味着“会话已失效、需要重新打开设备”。
+///
+/// 这些是 mtp-rs 明说“reopen to continue”的情形：设备被重置（Android 取消读的楔子）、
+/// 设备断开、或对象句柄被设备重新编号。重开 + 重新枚举即可继续。
+fn is_session_lost(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("device disconnected")
+        || m.contains("device was reset")
+        || m.contains("stale object handle")
+}
+
+/// 会话失效后的自愈：丢弃旧会话 → 静默几秒 → 空闲间隔重开 → 重新扫描重建句柄表。
+///
+/// 之所以要重扫：mtp-rs 的 handle 是 WPD 对象 id 的**确定性哈希**，重扫后同一张照片的
+/// handle/key 与原来完全一致，所以界面上的勾选、缩略图、详情都能原样保留。
+///
+/// 重开前的“安静期”和“间隔重试”是 mtp-rs 明确要求的：设备刚被重置时立刻连打
+/// close/open 反而会把它再顶死，所以前几次失败属于正常现象。
+async fn recover_session(state: &mut State, tx: &Sender<Evt>, cancel: &AtomicBool) -> Result<()> {
+    let summary = state.device_summary.clone();
+    let scope = state.last_scope;
+    let repaint = state.repaint.clone();
+
+    // 1) 静默丢弃旧会话：不发 Evt::Disconnected，界面订阅的连接状态保持不变。
+    if let Some(device) = state.device.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), device.close()).await;
+    }
+    state.storages.clear();
+    state.storage_meta.clear();
+    state.scan.stored.clear();
+
+    // 2) 空闲间隔地重开，前几次失败是正常的。
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..4u64 {
+        quiet_pause(2 + attempt, repaint.as_ref()).await;
+        match open_session(state, Some(summary.clone()), tx).await {
+            Ok(()) if !state.storages.is_empty() => {
+                last_err = None;
+                break;
+            }
+            Ok(()) => last_err = Some(anyhow::anyhow!("重连后设备没有可用的存储分区")),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e.context("设备会话失效后自动重连失败，请拔插一次数据线后手动重连"));
+    }
+
+    // 3) 重新枚举，重建丢掉的句柄映射（key/handle 不变）。
+    if let Some(scope) = scope {
+        let _ = tx.send(Evt::Log(
+            "已重新连接设备，正在重新扫描以恢复照片列表…".to_string(),
+        ));
+        scan(state, scope, tx, cancel).await?;
+    }
+    Ok(())
+}
+
+/// 安静地等 `secs` 秒，期间定期重绘界面（重连时窗口不至于看起来像卡死）。
+async fn quiet_pause(secs: u64, repaint: Option<&Arc<dyn Fn() + Send + Sync>>) {
+    for _ in 0..secs.saturating_mul(5) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(repaint) = repaint {
+            repaint();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,53 +863,94 @@ fn format_time(dt: Option<&mtp_rs::mtp::DateTime>) -> (Option<String>, Option<i6
 // 缩略图
 // ---------------------------------------------------------------------------
 
-async fn thumbnail(state: &State, key: u64, tx: &Sender<Evt>) -> Result<()> {
+async fn thumbnail(state: &mut State, key: u64, tx: &Sender<Evt>, cancel: &AtomicBool) -> Result<()> {
+    let mut result = read_thumbnail(state, key, tx).await;
+    if let Err(msg) = &result {
+        if is_device_unreachable(msg) {
+            // 设备 / 线 / 口层面的问题，重连也救不回来，提醒用户一次就好。
+            if state.should_report_unreachable() {
+                let _ = tx.send(Evt::Error(DEVICE_UNREACHABLE_HINT.to_string()));
+            }
+        } else if is_session_lost(msg) && state.recovery_allowed() {
+            // 会话失效时重连一次再读：读的是设备同一张照片，句柄在重扫后不变。
+            let _ = tx.send(Evt::Log(format!(
+                "读取缩略图失败（{msg}），疑似设备会话已失效，正在自动重连…"
+            )));
+            match recover_session(state, tx, cancel).await {
+                Ok(()) => result = read_thumbnail(state, key, tx).await,
+                Err(e) => result = Err(format!("{e:#}")),
+            }
+        }
+    }
+    let _ = tx.send(Evt::Thumbnail { key, result });
+    Ok(())
+}
+
+/// 取一张照片的缩略图字节并解码。
+///
+/// 只负责“一次读取”：优先用设备自带缩略图，失败就退化成读原图再缩小。
+/// 会话级别的失败由 [`thumbnail`] 负责重连后重试。
+async fn read_thumbnail(state: &mut State, key: u64, tx: &Sender<Evt>) -> Result<ThumbData, String> {
     let Some(stored) = state.scan.stored.get(&key) else {
-        return Ok(());
+        return Err("照片已不在列表中".to_string());
     };
-    let storage = &state.storages[stored.storage_index];
+    let storage_index = stored.storage_index;
     let handle = stored.handle;
+    let name = stored.info.filename.clone();
+    let size = stored.info.size;
 
     // 优先用设备自带的缩略图（快、流量小）。
-    match storage.thumbnail(handle).await {
-        Ok(bytes) => match decode_thumbnail(&bytes, THUMB_EDGE) {
-            Ok(data) => {
-                let _ = tx.send(Evt::Thumbnail {
-                    key,
-                    result: Ok(data),
-                });
-                return Ok(());
+    // 一旦发现它对这台设备不可用（例如报 0x80070141），就不再每张都试一遍：既省下一次设备
+    // 往返，也不会把日志刷爆。
+    if !state.thumbnail_resource_bad {
+        let mut mark_bad = false;
+        {
+            let storage = &state.storages[storage_index];
+            match storage.thumbnail(handle).await {
+                Ok(bytes) => match decode_thumbnail(&bytes, THUMB_EDGE) {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        let _ = tx.send(Evt::Log(format!(
+                            "{name} 的 MTP 缩略图无法解码（{e}），改为读取原图"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let msg = e.to_string();
+                    if thumbnail_missing(&msg) {
+                        // 只是这种文件没有缩略图，回退到读原图再缩小。
+                        let _ = tx.send(Evt::Log(format!(
+                            "{name} 没有可用缩略图（{msg}），改为读取原图"
+                        )));
+                    } else {
+                        mark_bad = true;
+                        let _ = tx.send(Evt::Log(format!(
+                            "设备缩略图资源不可用（{msg}），后续一律改为读取原图再缩放"
+                        )));
+                    }
+                }
             }
-            Err(e) => {
-                let _ = tx.send(Evt::Log(format!(
-                    "{} 的 MTP 缩略图无法解码（{e}），改为读取原图",
-                    stored.info.filename
-                )));
-            }
-        },
-        Err(e) => {
-            // 有些设备/格式没有缩略图，回退到读原图再缩小。
-            let _ = tx.send(Evt::Log(format!(
-                "{} 没有可用缩略图（{e}），改为读取原图",
-                stored.info.filename
-            )));
+        }
+        if mark_bad {
+            state.thumbnail_resource_bad = true;
         }
     }
 
-    if stored.info.size > THUMB_FALLBACK_MAX_BYTES {
-        let _ = tx.send(Evt::Thumbnail {
-            key,
-            result: Err("文件过大，已跳过缩略图".to_string()),
-        });
-        return Ok(());
+    if size > THUMB_FALLBACK_MAX_BYTES {
+        return Err("文件过大，已跳过缩略图".to_string());
     }
 
-    let result = match storage.download_to_vec(handle).await {
+    let storage = &state.storages[storage_index];
+    match storage.download_to_vec(handle).await {
         Ok(bytes) => decode_thumbnail(&bytes, THUMB_EDGE).map_err(|e| e.to_string()),
         Err(e) => Err(format!("读取失败: {e}")),
-    };
-    let _ = tx.send(Evt::Thumbnail { key, result });
-    Ok(())
+    }
+}
+
+/// 设备只是“这张没有缩略图”（`mtp-rs` 把它们映射成 Unsupported / NotFound），不是设备级故障。
+fn thumbnail_missing(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("not supported") || m.contains("unsupported") || m.contains("not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -767,12 +958,40 @@ async fn thumbnail(state: &State, key: u64, tx: &Sender<Evt>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// 读取并解析一张照片的 EXIF，结果通过 [`Evt::Exif`] 回给界面。
-async fn load_exif(state: &State, key: u64, tx: &Sender<Evt>) -> Result<()> {
+///
+/// 扫描结束后设备会话有时会失效（WPD 报 `0x80070141 无法连接至设备`），此时会自动
+/// 重连并重扫一次，再重读这张照片的 EXIF。
+async fn load_exif(state: &mut State, key: u64, tx: &Sender<Evt>, cancel: &AtomicBool) -> Result<()> {
     let Some(stored) = state.scan.stored.get(&key) else {
         return Ok(());
     };
-    let storage = &state.storages[stored.storage_index];
-    let result = fetch_exif(storage, stored.handle, stored.info.size).await;
+    let storage_index = stored.storage_index;
+    let handle = stored.handle;
+    let mut size = stored.info.size;
+
+    let mut result = fetch_exif(&state.storages[storage_index], handle, size).await;
+    if let Err(msg) = &result {
+        if is_device_unreachable(msg) {
+            // 设备 / 线 / 口层面的问题，重连也救不回来，提醒用户一次就好。
+            if state.should_report_unreachable() {
+                let _ = tx.send(Evt::Error(DEVICE_UNREACHABLE_HINT.to_string()));
+            }
+        } else if is_session_lost(msg) && state.recovery_allowed() {
+            let _ = tx.send(Evt::Log(format!(
+                "读取 EXIF 失败（{msg}），疑似设备会话已失效，正在自动重连…"
+            )));
+            match recover_session(state, tx, cancel).await {
+                Ok(()) => {
+                    // 重扫后同一张照片的 handle 不变（句柄是 WPD 对象 id 的确定性哈希）。
+                    if let Some(s) = state.scan.stored.get(&key) {
+                        size = s.info.size;
+                    }
+                    result = fetch_exif(&state.storages[storage_index], handle, size).await;
+                }
+                Err(e) => result = Err(format!("{e:#}")),
+            }
+        }
+    }
     let _ = tx.send(Evt::Exif { key, result });
     Ok(())
 }

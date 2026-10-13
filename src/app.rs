@@ -1124,7 +1124,7 @@ impl eframe::App for PhoneToolApp {
     /// 退出时把 MTP 会话关干净。
     ///
     /// 不关就直接杀进程，手机上那条 MTP 连接会卡住，之后所有数据读取都会报
-    /// `0x80070141 无法连接至设备`，必须拔插数据线才能恢复。
+    /// `0x80070141 无法连接至设备`（这种失效工作线程里会自动重连兜底，但不保证一定成功）。
     fn on_exit(&mut self) {
         if self.connected.is_some() {
             self.send(Cmd::Disconnect);
