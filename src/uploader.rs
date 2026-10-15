@@ -7,6 +7,9 @@
 //! | `metadata`（可配置）     | text/json   | 照片全部信息的 JSON（见 `build_photo_metadata`） |
 //! | `file`（可配置）         | binary      | 照片文件本身；关闭“上传文件”时不发送     |
 //!
+//! **上传的文件已经过处理**：`crate::prepare` 会剥掉 EXIF/GPS/注释等额外信息，
+//! 并对支持的格式做无损压缩（详见该模块），所以到这里时已是"干净"的文件。
+//!
 //! 服务端只要返回任意 2xx 即视为成功。
 
 use std::time::{Duration, Instant};
@@ -122,15 +125,22 @@ impl Uploader {
 ///   "device": { …DeviceSummary… },
 ///   "storage": { …StorageSummary… },
 ///   "photo": { …照片全部字段… },
-///   "file_included": true
+///   "file_included": true,
+///   "file": { "filename": "IMG_0001.JPG", "mime_type": "image/jpeg",
+///             "size_bytes": 3212345, "original_size_bytes": 3298765,
+///             "metadata_stripped": true }
 /// }
 /// ```
+///
+/// `file` 为 `None` 表示本次没上传文件（只传信息），`file_included` 会是 `false`，
+/// `file` 字段则是 `null`。
 pub fn build_photo_metadata(
     device: &serde_json::Value,
     storage: &serde_json::Value,
     photo: &serde_json::Value,
-    file_included: bool,
+    file: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    let file_included = file.is_some();
     serde_json::json!({
         "request_id": uuid::Uuid::new_v4().to_string(),
         "uploaded_at": chrono::Local::now().to_rfc3339(),
@@ -142,5 +152,6 @@ pub fn build_photo_metadata(
         "storage": storage,
         "photo": photo,
         "file_included": file_included,
+        "file": file,
     })
 }

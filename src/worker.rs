@@ -21,11 +21,13 @@ use anyhow::{Context, Result};
 use mtp_rs::mtp::{MtpDevice, ObjectHandle, Storage};
 use mtp_rs::UtcOffset;
 
+use crate::cache::PhotoCache;
 use crate::exif::{self, ExifData};
 use crate::model::{
     DeviceSummary, ExifState, PhotoInfo, ScanScope, ScanStats, StorageSummary, ThumbState,
     UploadConfig,
 };
+use crate::prepare;
 use crate::thumbs::{decode_thumbnail, is_photo_extension, mime_from_filename, ThumbData};
 use crate::uploader::{build_photo_metadata, PhotoFile, Uploader};
 
@@ -39,10 +41,6 @@ const SNAPSHOT_EVERY: usize = 150;
 const THUMB_EDGE: u32 = 320;
 /// 缩略图失败后回退到整张图片解码时允许的最大字节数。
 const THUMB_FALLBACK_MAX_BYTES: u64 = 24 * 1024 * 1024;
-/// 读 EXIF 时先只看文件头的字节数（JPEG 的 EXIF 在 APP1，位于文件最前面）。
-const EXIF_HEAD_BYTES: u64 = 128 * 1024;
-/// 文件头里没读到 EXIF 时，允许整张下载再试的上限（HEIC 等 EXIF 藏在后面）。
-const EXIF_FULL_MAX_BYTES: u64 = 24 * 1024 * 1024;
 
 /// 界面发给工作线程的命令。
 pub enum Cmd {
@@ -56,10 +54,16 @@ pub enum Cmd {
     Scan { scope: ScanScope },
     /// 拉取一张照片的缩略图。
     Thumbnail { key: u64 },
-    /// 读取一张照片的 EXIF。
-    Exif { key: u64 },
+    /// 取一张照片的 EXIF：先把照片下载到本地缓存，再解析**缓存文件**的 EXIF。
+    /// `force = true` 时忽略已有缓存，重新从手机下载。
+    Exif { key: u64, force: bool },
     /// 上传指定照片（元数据必传，文件是否上传由 `cfg.upload_file` 决定）。
+    /// 文件会先剥离额外信息（EXIF/GPS/注释…）并做无损压缩，再上传。
     Upload { keys: Vec<u64>, cfg: UploadConfig },
+    /// 清空本地照片缓存。
+    ClearCache,
+    /// 查一下缓存占用并回报给界面。
+    RefreshCacheStats,
 }
 
 /// 工作线程发给界面的事件。
@@ -95,6 +99,11 @@ pub enum Evt {
     Exif {
         key: u64,
         result: Result<ExifData, String>,
+    },
+    /// 本地缓存占用情况。
+    CacheStats {
+        bytes: u64,
+        files: usize,
     },
     UploadStarted {
         total: usize,
@@ -170,6 +179,10 @@ struct State {
     thumbnail_resource_bad: bool,
     /// 最近一次向用户提示“设备够不着”的时间；同一类错误只提醒一次，别刷屏。
     unreachable_last: Option<Instant>,
+    /// 本地照片缓存：原图只从手机下载一次，EXIF 解析与上传都读它。
+    cache: PhotoCache,
+    /// 已经解析好的 EXIF（key → 结果），上传时直接复用，避免重复解析。
+    exif: HashMap<u64, Result<ExifData, String>>,
 }
 
 impl State {
@@ -273,8 +286,13 @@ async fn handle_cmd(
             scan(state, scope, tx, cancel).await
         }
         Cmd::Thumbnail { key } => thumbnail(state, key, tx, cancel).await,
-        Cmd::Exif { key } => load_exif(state, key, tx, cancel).await,
-        Cmd::Upload { keys, cfg } => upload(state, keys, cfg, tx).await,
+        Cmd::Exif { key, force } => load_exif(state, key, force, tx, cancel).await,
+        Cmd::Upload { keys, cfg } => upload(state, keys, cfg, tx, cancel).await,
+        Cmd::ClearCache => clear_cache(state, tx),
+        Cmd::RefreshCacheStats => {
+            send_cache_stats(state, tx);
+            Ok(())
+        }
     }
 }
 
@@ -954,22 +972,62 @@ fn thumbnail_missing(msg: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// EXIF
+// 本地缓存 + EXIF
 // ---------------------------------------------------------------------------
+//
+// 设计要点：**原图只从手机下载一次**。
+//
+// * 用户在网格里选中一张照片时（详情面板）才触发下载 + 解析 EXIF；
+// * 下载下来的原图落在本地缓存目录里；
+// * 上传时复用同一份缓存，再从缓存字节里剥元数据 / 无损压缩，最后才 POST。
+//
+// 这样既满足“只有选中照片才解析 EXIF”，又保证上传前一定做了剥离 + 无损压缩。
 
-/// 读取并解析一张照片的 EXIF，结果通过 [`Evt::Exif`] 回给界面。
+/// 把缓存占用回报给界面。
+fn send_cache_stats(state: &State, tx: &Sender<Evt>) {
+    let (bytes, files) = state.cache.stats();
+    let _ = tx.send(Evt::CacheStats { bytes, files });
+}
+
+/// 清空缓存（也顺手清掉已解析的 EXIF 记录）。
+fn clear_cache(state: &mut State, tx: &Sender<Evt>) -> Result<()> {
+    let freed = state.cache.clear();
+    state.exif.clear();
+    let _ = tx.send(Evt::Log(format!(
+        "已清空本地照片缓存，释放 {:.2} MB",
+        freed as f64 / 1024.0 / 1024.0
+    )));
+    send_cache_stats(state, tx);
+    Ok(())
+}
+
+/// 取一张照片的**原始字节**（未经任何处理），优先用本地缓存。
 ///
-/// 扫描结束后设备会话有时会失效（WPD 报 `0x80070141 无法连接至设备`），此时会自动
-/// 重连并重扫一次，再重读这张照片的 EXIF。
-async fn load_exif(state: &mut State, key: u64, tx: &Sender<Evt>, cancel: &AtomicBool) -> Result<()> {
-    let Some(stored) = state.scan.stored.get(&key) else {
-        return Ok(());
-    };
-    let storage_index = stored.storage_index;
-    let handle = stored.handle;
-    let mut size = stored.info.size;
+/// * 缓存命中且 `force == false` → 直接读文件，完全不碰设备；
+/// * 否则整张从手机下载，写进缓存后返回。
+///
+/// 会话失效（`stale object handle` 之类）会自动重连并重试一次 —— 重扫后
+/// 同一张照片的句柄不变，所以重试用的还是同一个 handle。
+async fn ensure_cached(
+    state: &mut State,
+    photo: &PhotoInfo,
+    storage_index: usize,
+    handle: ObjectHandle,
+    force: bool,
+    tx: &Sender<Evt>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let path = state
+        .cache
+        .path_for(photo.storage_id, photo.handle, photo.size, &photo.filename);
 
-    let mut result = fetch_exif(&state.storages[storage_index], handle, size).await;
+    if !force {
+        if let Some(bytes) = state.cache.read(&path) {
+            return Ok(bytes);
+        }
+    }
+
+    let mut result = download_bytes(state, storage_index, handle).await;
     if let Err(msg) = &result {
         if is_device_unreachable(msg) {
             // 设备 / 线 / 口层面的问题，重连也救不回来，提醒用户一次就好。
@@ -978,79 +1036,82 @@ async fn load_exif(state: &mut State, key: u64, tx: &Sender<Evt>, cancel: &Atomi
             }
         } else if is_session_lost(msg) && state.recovery_allowed() {
             let _ = tx.send(Evt::Log(format!(
-                "读取 EXIF 失败（{msg}），疑似设备会话已失效，正在自动重连…"
+                "读取 {} 失败（{msg}），疑似设备会话已失效，正在自动重连…",
+                photo.filename
             )));
             match recover_session(state, tx, cancel).await {
-                Ok(()) => {
-                    // 重扫后同一张照片的 handle 不变（句柄是 WPD 对象 id 的确定性哈希）。
-                    if let Some(s) = state.scan.stored.get(&key) {
-                        size = s.info.size;
-                    }
-                    result = fetch_exif(&state.storages[storage_index], handle, size).await;
-                }
-                Err(e) => result = Err(format!("{e:#}")),
+                Ok(()) => result = download_bytes(state, storage_index, handle).await,
+                Err(e) => return Err(format!("{e:#}")),
             }
         }
     }
+    let bytes = result?;
+
+    match state.cache.write(&path, &bytes) {
+        Ok(()) => {
+            let _ = tx.send(Evt::Log(format!(
+                "已缓存 {}（{}）",
+                photo.filename,
+                crate::thumbs::human_bytes(bytes.len() as u64)
+            )));
+        }
+        Err(e) => {
+            // 缓存失败不影响这次处理，只是下次还得重新下载。
+            let _ = tx.send(Evt::Log(format!("写入本地缓存失败（不影响本次处理）: {e}")));
+        }
+    }
+    send_cache_stats(state, tx);
+    Ok(bytes)
+}
+
+/// 从设备上整张读一个对象。
+async fn download_bytes(
+    state: &State,
+    storage_index: usize,
+    handle: ObjectHandle,
+) -> Result<Vec<u8>, String> {
+    let Some(storage) = state.storages.get(storage_index) else {
+        return Err("存储分区已失效，请重新连接设备".to_string());
+    };
+    storage
+        .download_to_vec(handle)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// 选中某张照片时：把照片下载到本地缓存，再解析**缓存文件**里的 EXIF。
+///
+/// 结果记在 `state.exif` 里，上传时优先复用，避免重复解析。
+async fn load_exif(
+    state: &mut State,
+    key: u64,
+    force: bool,
+    tx: &Sender<Evt>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let Some(stored) = state.scan.stored.get(&key) else {
+        return Ok(());
+    };
+    let photo = stored.info.clone();
+    let storage_index = stored.storage_index;
+    let handle = stored.handle;
+
+    let result = match ensure_cached(state, &photo, storage_index, handle, force, tx, cancel).await {
+        Ok(bytes) => exif::parse(&bytes).map_err(|e| format!("{e:#}")),
+        Err(msg) => Err(msg),
+    };
+    state.exif.insert(key, result.clone());
     let _ = tx.send(Evt::Exif { key, result });
     Ok(())
 }
 
-/// 真正去设备上取 EXIF：先只读文件头（快），不行再退化成整张下载。
-///
-/// 上传流程和 CLI 诊断都用这一个函数，保证现场跑的代码路径一致。
-pub(crate) async fn fetch_exif(
-    storage: &Storage,
-    handle: ObjectHandle,
-    size: u64,
-) -> Result<ExifData, String> {
-    let mut last_err: String;
-
-    // 1) 只读文件头。EXIF 的 APP1 段最大 64KB，所以 128KB 的文件头对 JPEG 一定是够的。
-    let head_len = if size == 0 {
-        EXIF_HEAD_BYTES
-    } else {
-        size.min(EXIF_HEAD_BYTES)
-    } as u32;
-    let mut maybe_deeper = true;
-    match storage.read_range(handle, 0, head_len).await {
-        Ok(bytes) => {
-            let format = exif::sniff_format(&bytes);
-            match exif::parse(&bytes) {
-                Ok(data) => return Ok(data),
-                Err(_) => last_err = format!("{format} 文件里没有 EXIF"),
-            }
-            // JPEG/GIF/BMP 的 EXIF 只可能在文件头里；既然没有就别白下载整张了。
-            // HEIC/AVIF/WebP/PNG 的元数据可能排在后面，才值得再整张读一次。
-            maybe_deeper = matches!(
-                format,
-                "HEIC/HEIF/MP4 系" | "AVIF" | "WebP" | "PNG" | "未知格式"
-            );
-        }
-        Err(e) => last_err = format!("读取文件头失败: {e}"),
-    }
-
-    if !maybe_deeper {
-        return Err(last_err);
-    }
-
-    // 2) 退化成整张下载再试（HEIC 等的 EXIF 不在文件头）。
-    if size == 0 || size <= EXIF_FULL_MAX_BYTES {
-        match storage.download_to_vec(handle).await {
-            Ok(bytes) => match exif::parse(&bytes) {
-                Ok(data) => return Ok(data),
-                Err(e) => last_err = format!("{e}"),
-            },
-            Err(e) => last_err = format!("读取整张照片失败: {e}"),
-        }
-    } else {
-        last_err.push_str(&format!(
-            "（文件 {} 超过整张读取上限，未读到 EXIF）",
-            crate::thumbs::human_bytes(size)
-        ));
-    }
-
-    Err(last_err)
+/// 整张下载一张照片并解析 EXIF（命令行诊断用，保证和界面跑的是同一套读取逻辑）。
+pub(crate) async fn fetch_exif(storage: &Storage, handle: ObjectHandle) -> Result<ExifData, String> {
+    let bytes = storage
+        .download_to_vec(handle)
+        .await
+        .map_err(|e| format!("读取照片失败: {e:#}"))?;
+    exif::parse(&bytes).map_err(|e| format!("{e:#}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,7 +1119,21 @@ pub(crate) async fn fetch_exif(
 // ---------------------------------------------------------------------------
 
 /// 逐个上传选中的照片：**同一个接口**，元数据必发，文件可选。
-async fn upload(state: &State, keys: Vec<u64>, cfg: UploadConfig, tx: &Sender<Evt>) -> Result<()> {
+///
+/// 文件走这样一条流水线（缓存 → 剥离 → 无损压缩 → 上传）：
+///
+/// ```text
+/// 本地缓存（没有就从手机下载一次）
+///    └─ 原始字节 ──┬─→ 解析 EXIF（放进元数据，解析的是**原始**文件）
+///                  └─→ 剥掉 EXIF/XMP/注释… + 无损压缩 ──→ multipart 的 file 字段
+/// ```
+async fn upload(
+    state: &mut State,
+    keys: Vec<u64>,
+    cfg: UploadConfig,
+    tx: &Sender<Evt>,
+    cancel: &AtomicBool,
+) -> Result<()> {
     if keys.is_empty() {
         let _ = tx.send(Evt::Log("没有选中任何照片".to_string()));
         return Ok(());
@@ -1074,7 +1149,7 @@ async fn upload(state: &State, keys: Vec<u64>, cfg: UploadConfig, tx: &Sender<Ev
     let _ = tx.send(Evt::Log(format!(
         "开始上传 {total} 张照片 → {endpoint}（{}）",
         if cfg.upload_file {
-            "元数据 + 照片文件"
+            "元数据 + 照片文件（已剥离额外信息并无损压缩）"
         } else {
             "仅元数据"
         }
@@ -1086,54 +1161,55 @@ async fn upload(state: &State, keys: Vec<u64>, cfg: UploadConfig, tx: &Sender<Ev
     let mut failed = 0usize;
 
     for (i, key) in keys.iter().enumerate() {
-        let Some(stored) = state.scan.stored.get(key) else {
-            continue;
+        let key = *key;
+        // 先把要用的字段拷出来，之后才能可变借用 state（读缓存 / 重连）。
+        let (photo, storage_index, handle) = match state.scan.stored.get(&key) {
+            Some(s) => (s.info.clone(), s.storage_index, s.handle),
+            None => continue,
         };
-        let photo = &stored.info;
         let storage_json = state
             .storage_meta
-            .get(stored.storage_index)
+            .get(storage_index)
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or_default();
 
-        // 1) 需要的话先把照片从手机读出来。
-        let mut file: Option<PhotoFile> = None;
         let mut note = String::new();
-        if cfg.upload_file {
-            let too_big = cfg.max_file_bytes > 0 && photo.size > cfg.max_file_bytes;
-            if too_big {
-                note = format!(
-                    "（超过 {}，本次只上传信息）",
-                    crate::thumbs::human_bytes(cfg.max_file_bytes)
-                );
-            } else {
-                let storage = &state.storages[stored.storage_index];
-                match storage.download_to_vec(stored.handle).await {
-                    Ok(bytes) => {
-                        file = Some(PhotoFile {
-                            filename: photo.filename.clone(),
-                            mime: photo.mime_type.clone(),
-                            bytes,
-                        });
-                    }
-                    Err(e) => {
-                        note = format!("（读取照片失败，只上传信息: {e}）");
-                    }
-                }
+
+        // 1) 拿原图字节（缓存优先，只从手机下载一次）。上传文件要用，读 EXIF 也要用。
+        let too_big = cfg.upload_file && cfg.max_file_bytes > 0 && photo.size > cfg.max_file_bytes;
+        if too_big {
+            note.push_str(&format!(
+                "（超过单文件上限 {}，本次只上传信息）",
+                crate::thumbs::human_bytes(cfg.max_file_bytes)
+            ));
+        }
+        let want_file = cfg.upload_file && !too_big;
+        let mut raw: Option<Vec<u8>> = None;
+        if want_file || cfg.include_exif {
+            match ensure_cached(state, &photo, storage_index, handle, false, tx, cancel).await {
+                Ok(bytes) => raw = Some(bytes),
+                Err(e) => note.push_str(&format!("（读取原图失败：{e}）")),
             }
         }
 
-        // 2) 需要的话把 EXIF 也读出来（会一起发给服务器）。
+        // 2) EXIF：优先用「选中照片看详情」时已经解析好的结果；没有就从原始字节解析。
         let exif = if cfg.include_exif {
-            let storage = &state.storages[stored.storage_index];
-            match fetch_exif(storage, stored.handle, photo.size).await {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    if !note.is_empty() {
-                        note.push(' ');
+            if let Some(Ok(data)) = state.exif.get(&key) {
+                Some(data.clone())
+            } else {
+                match raw.as_deref().map(exif::parse) {
+                    Some(Ok(data)) => {
+                        state.exif.insert(key, Ok(data.clone()));
+                        Some(data)
                     }
-                    note.push_str(&format!("（无 EXIF: {e}）"));
-                    None
+                    Some(Err(e)) => {
+                        note.push_str(&format!("（无 EXIF：{e:#}）"));
+                        None
+                    }
+                    None => {
+                        note.push_str("（无 EXIF：未取到原图）");
+                        None
+                    }
                 }
             }
         } else {
@@ -1141,13 +1217,40 @@ async fn upload(state: &State, keys: Vec<u64>, cfg: UploadConfig, tx: &Sender<Ev
         };
         let exif_note = match &exif {
             Some(data) => format!("EXIF {} 项", data.field_count),
-            None => "无 EXIF".to_string(),
+            None if cfg.include_exif => "无 EXIF".to_string(),
+            None => "未读 EXIF".to_string(),
         };
 
-        // 3) 同一接口 POST。
-        let file_included = file.is_some();
-        let photo_json = photo_metadata_json(photo, exif.as_ref());
-        let metadata = build_photo_metadata(&device_json, &storage_json, &photo_json, file_included);
+        // 3) 文件：剥离额外信息 + 无损压缩后才上传。
+        let mut file: Option<PhotoFile> = None;
+        let mut file_json: Option<serde_json::Value> = None;
+        if want_file {
+            if let Some(bytes) = raw.take() {
+                let prepared = prepare::prepare(&photo.filename, &photo.mime_type, bytes);
+                if !prepared.note.is_empty() {
+                    if !note.is_empty() {
+                        note.push(' ');
+                    }
+                    note.push_str(&format!("（{}）", prepared.note));
+                }
+                file_json = Some(serde_json::json!({
+                    "filename": prepared.filename,
+                    "mime_type": prepared.mime,
+                    "size_bytes": prepared.bytes.len(),
+                    "original_size_bytes": prepared.original_len,
+                    "metadata_stripped": prepared.stripped,
+                }));
+                file = Some(PhotoFile {
+                    filename: prepared.filename,
+                    mime: prepared.mime,
+                    bytes: prepared.bytes,
+                });
+            }
+        }
+
+        // 4) 同一接口 POST。
+        let photo_json = photo_metadata_json(&photo, exif.as_ref());
+        let metadata = build_photo_metadata(&device_json, &storage_json, &photo_json, file_json);
         let (success, message) = match uploader.post_photo(&cfg, &metadata, file).await {
             Ok(outcome) if outcome.is_success() => {
                 ok += 1;

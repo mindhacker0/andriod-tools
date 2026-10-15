@@ -371,8 +371,8 @@ fn exif_dump(limit: usize) -> Result<()> {
 
         for obj in &found {
             println!("\n--- {} （{} 字节）---", obj.filename, obj.size);
-            // 复用上传时用的同一套读取逻辑（先读文件头，不行再整张下载）
-            match crate::worker::fetch_exif(storage, obj.handle, obj.size).await {
+            // 复用上传时用的同一套读取逻辑：整张下载后解析
+            match crate::worker::fetch_exif(storage, obj.handle).await {
                 Ok(data) => {
                     println!(
                         "相机   : {}",

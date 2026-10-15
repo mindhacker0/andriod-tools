@@ -1,8 +1,12 @@
 //! EXIF 元数据：从照片字节里解析出来，用于界面展示和随上传一起发给服务器。
 //!
 //! 解析用 [`kamadak_exif`]，它支持 JPEG / TIFF / PNG(eXIf) / WebP / HEIC 容器。
-//! 注意：EXIF 一般在文件最前面（JPEG 的 APP1），所以优先只读文件头；
-//! HEIC 的 `meta` box 可能在后面，读头失败时会退化成整张下载。
+//!
+//! 解析的是**本地缓存文件**里的原始字节（见 [`crate::cache`]）：只有用户选中某张照片
+//! （打开详情）时，才会把这张照片从手机下载到缓存再解析，不会给整个列表预先解析。
+//!
+//! 顺序很关键：先解析 EXIF、**再**剥离元数据。上传的文件会被 [`crate::prepare`]
+//! 去掉 EXIF/GPS 等额外信息，那之后就没得解析了。
 
 use std::collections::BTreeMap;
 use std::io::Cursor;

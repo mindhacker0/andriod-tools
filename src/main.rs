@@ -7,9 +7,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cache;
 mod cli;
 mod exif;
 mod model;
+mod prepare;
 mod thumbs;
 mod uploader;
 mod worker;

@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.36"
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

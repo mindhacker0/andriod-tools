@@ -107,6 +107,11 @@ pub struct PhoneToolApp {
     upload_last: Option<String>,
     upload_summary: Option<(usize, usize)>,
 
+    // ── 本地缓存 ──
+    cache_bytes: u64,
+    cache_files: usize,
+    cache_root: String,
+
     // ── 其它 ──
     detail_key: Option<u64>,
     show_detail: bool,
@@ -159,6 +164,10 @@ impl PhoneToolApp {
             upload_last: None,
             upload_summary: None,
 
+            cache_bytes: 0,
+            cache_files: 0,
+            cache_root: crate::cache::default_root().display().to_string(),
+
             detail_key: None,
             show_detail: false,
             log: VecDeque::new(),
@@ -170,6 +179,7 @@ impl PhoneToolApp {
         app.push_log("就绪。请把手机用 USB 连上电脑，USB 用途选择“文件传输 / MTP”，然后点“刷新设备”。");
         println!("phone-tool 已启动，正在枚举 MTP 设备…（Windows 上走系统 WPD，无需驱动）");
         app.send(Cmd::ListDevices);
+        app.send(Cmd::RefreshCacheStats);
         app
     }
 
@@ -287,6 +297,10 @@ impl PhoneToolApp {
                             Err(msg) => ExifState::Failed(msg),
                         };
                     }
+                }
+                Evt::CacheStats { bytes, files } => {
+                    self.cache_bytes = bytes;
+                    self.cache_files = files;
                 }
                 Evt::UploadStarted { total } => {
                     self.uploading = true;
@@ -699,6 +713,13 @@ impl PhoneToolApp {
                         });
                     ui.checkbox(&mut self.cfg.upload_file, "上传照片文件本身（关闭则只上传信息）");
                     ui.checkbox(&mut self.cfg.include_exif, "读取并上传 EXIF 元数据（相机/时间/曝光/GPS）");
+                    ui.label(
+                        RichText::new(
+                            "上传前会自动剥离 EXIF/GPS/注释等额外信息并对文件做无损压缩（画质不变）。",
+                        )
+                        .small()
+                        .weak(),
+                    );
                     ui.label(RichText::new(format!("POST {}", self.cfg.endpoint())).small().weak());
 
                     ui.add_space(6.0);
@@ -740,6 +761,33 @@ impl PhoneToolApp {
                             if failed == 0 { Color32::from_rgb(80, 180, 120) } else { Color32::from_rgb(220, 140, 60) },
                             format!("上次上传：成功 {ok}，失败 {failed}"),
                         );
+                    }
+
+                    ui.separator();
+                    ui.heading("④ 本地缓存");
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "已缓存 {} 个文件，占用 {}",
+                            self.cache_files,
+                            human_bytes(self.cache_bytes)
+                        ));
+                        if ui.small_button("刷新").clicked() {
+                            self.send(Cmd::RefreshCacheStats);
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "选中照片时会把原图下载到这里并解析 EXIF；上传时复用同一份，避免重复从手机读取。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.label(RichText::new(self.cache_root.as_str()).small().weak());
+                    if ui
+                        .add_enabled(self.cache_files > 0, egui::Button::new("🗑 清空缓存"))
+                        .clicked()
+                    {
+                        self.send(Cmd::ClearCache);
                     }
                 });
             });
@@ -1146,9 +1194,10 @@ impl PhoneToolApp {
             return;
         };
 
-        // 第一次看到这张照片时自动去设备上读 EXIF。
+        // 只有被选中的照片才会触发解析：第一次看到它时把原图下载到本地缓存，
+        // 再解析缓存文件的 EXIF（不会为整个列表预先解析）。
         if matches!(photo.exif, ExifState::Idle) {
-            self.request_exif(key);
+            self.request_exif(key, false);
         }
 
         draw_photo_detail(ui, &photo);
@@ -1161,7 +1210,7 @@ impl PhoneToolApp {
             ExifState::Idle | ExifState::Loading => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("正在从手机读取 EXIF…");
+                    ui.label("正在下载照片到本地缓存并解析 EXIF…");
                 });
             }
             ExifState::Failed(msg) => {
@@ -1186,16 +1235,20 @@ impl PhoneToolApp {
             }
         }
         if retry {
-            self.request_exif(key);
+            // 用户手动点“重新读取”→ 忽略缓存，重新从手机下载。
+            self.request_exif(key, true);
         }
     }
 
     /// 把某张照片的 EXIF 状态置为“读取中”并请求工作线程去读。
-    fn request_exif(&mut self, key: u64) {
+    ///
+    /// `force = false` 时优先用本地缓存（已下载过的照片不再打扰手机）；
+    /// `force = true` 时忽略缓存重新下载。
+    fn request_exif(&mut self, key: u64, force: bool) {
         if let Some(p) = self.photos.iter_mut().find(|p| p.key == key) {
             p.exif = ExifState::Loading;
         }
-        self.send(Cmd::Exif { key });
+        self.send(Cmd::Exif { key, force });
     }
 }
 

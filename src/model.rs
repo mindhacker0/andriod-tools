@@ -172,8 +172,14 @@ pub struct UploadConfig {
     /// 表单里文件字段名。
     pub field_file: String,
     /// 是否把照片文件本身一起上传（关闭则只上传信息）。
+    ///
+    /// 勾选时也不是原样上传：文件会先经过 [`crate::prepare`] —— 剥离 EXIF/GPS/注释等
+    /// 额外信息，并对支持的格式做无损压缩，画质不变。
     pub upload_file: bool,
-    /// 是否读取照片 EXIF 并随信息一起上传。
+    /// 是否解析照片 EXIF 并随信息一起上传。
+    ///
+    /// 解析的是**缓存里的原始文件**（剥离元数据之前）。界面上选中照片时也会解析一次，
+    /// 结果会复用，不会重复解析。
     pub include_exif: bool,
     /// 单文件上限，超过则跳过文件只传信息（0 = 不限制）。
     pub max_file_bytes: u64,
